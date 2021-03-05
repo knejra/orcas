@@ -1,0 +1,125 @@
+Scheduling
+Any operating system is likely to run with more processes than the computer has processros, and so a plan is needed to time-share the processors among the processes.
+Ideally the sharing would be transparent to user processes. A common approach is to provide each process with the illusion that it has its own virtual processor by 
+multiplexing the processes onto the hardware processors. This chapter explains how xv6 achieves this multiplexing.
+
+Multiplexting
+Xv6 multiplexes by switching each processor from one process to another in two situations. First, xv6's sleep and wake mechanism switches when a process waits for 
+device or pipe I/O to complete, or waits for a child to exit, or waits in the sleep system call. Second, xv6 periodically forces a switch when a process is executing
+user instructions. This multiplexting creates the illusion that each process has its own CPU, just as xv6 uses the memory allocator and hardware page tables to create
+the illusion that each process has its own memory.
+Implementing multiplexting poses a few challenges. First, how to switch from one process to another? Xv6 uses the standard mechanism of context switching; although the
+idea is simple, the implementing is some of the most opaque code in the system. Second, how to do context switching transparently? Xv6 uses the standard technique of 
+using the timer interrupt handler to drive context switches. Third, many CPUs may be switching among processes concurrently, and a locking plan is necessary to avoid races.
+Fourth, when a process has exited its memory and other resources must be freed, but it cannot do all of this itself because it can't free its own kernel stack while still 
+using it. Finally, on a multiprocessor, each processor may run a process and when a processor switches from one process to another, the core must know which process it is 
+running so that it can save the state of the currently running process in the correct proc structure. Xv6 tries to solve these problem as simply as possible, but nevertheless
+the resulting code is tricky.
+xv6 must provide ways for processes to coordinate among themselves. For example, a parent process may need to wait for one of its children to exit, or a process reading a pipe 
+may need to wait for some other process to write the pipe. Rather than make the waiting process waste CPU by repeatedly checking whether the desired event has happened, xv6 allows
+a process to give up the CPU and sleep waiting for an event, and allows another process to wake the first process up. Care is needed to avoid races that result in loas of event 
+notifications. As an example of these problems and their solution, this chapter examines the implementation of pipes.
+Code: context switching 
+Figure 5-1 outlines the steps involve in switching from one user process to another: a user-kernle transition to the old process's kernel thread, a context switch to the local 
+CPU's scheduler thread, a context switch to a new process's kernel thread, and a trap return to the user-level process. Xv6 uses two context switches because the scheduler runs on 
+its own stack in order to simplify cleaning up user processes, as we will see when discussiing the code for exit and kill. In this section we'll examine the meachinics of switching 
+between a kernel thread and a scheduler thread.
+Evert xv6 process has its own kernel stack and register set, as we saw in Chapter 2. Each CPU has a separate schduler thread for use when it is executing the scheduler rather than any 
+process's kernel thread. Switching from one thread to another involves saving the old thread's CPU registers, and restoring the previously-saved registers of the new thread;
+the fact that %esp and %eip are saved and restored means that the CPU will switch stacks and switch what code it is executing.
+swtch doesn't directly know about threads; it just saves and restores register sets, called contexts. When it is time for a process to give up the CPU, the process's kernel thread calls 
+swtch to save its own context and return to the scheduler context. Each context is representd by a struct context*, a pointer to a structure stored on the kernel stack involved. Swtch 
+takes two arguments: struct context **old and struct context *new. It pushes the current CPU register onto the stack and saves the stack pointer in *old. Then swtch copies new to %esp, 
+pops previously saved registers, and returns.
+Let's follow the intial user process through swtch into the scheduler. We saw in Chapter 3 that one possibility at the end of each interrupt is the trap calls yield. Yield in turn calls 
+sched, which calls swtch to save the current context in proc->context and switch to the scheduler context previously saved in cpu->scheduler.
+void yield(void)
+{
+    acquire(&ptable.lock);
+    myproc()->state = RUNNABLE;
+    sched();
+    release(&ptable.lock);
+}
+
+void sched(void)
+{
+    swtch(&p->context, mycpu()->scheduler);
+}
+
+struct context *cpu::scheduler;
+
+.globl swtch
+swtch:
+  movl 4(%esp), %eax
+  movl 8(%esp), %edx
+
+  # Save old callee-saved registers 
+  pushl %ebp
+  pushl %ebx
+  pushl %esi 
+  pushl %edi 
+
+  # Switch stacks
+  movl %esp, (%eax)
+  movl %edx, %esp
+
+  # Load new callee-saved registers 
+  popl %edi
+  popl %esi
+  popl %ebx
+  popl %ebp 
+  ret
+
+Swtch starts by copying its arguments from the stack to the caller-saved registers %eax and %edx; swtch must do this before it changes the stack pointer
+and can no longer access the arguments via %esp. Then swtch pushes the register state, creating a context structure on the current stack. Only the callee-
+saved registers need to be saved; the convention on the x86 is that these are %ebp, %ebx, %esi, %edi, and %esp. Swtch pushes the first four explicitly; it 
+saves the last implicitly as the struct context* written to *old. There is one more important register: the program counter %eip. It has already been saved 
+on the stack by the call instruction that invoked swtch. Having saved the old context, swtch is ready to restore the new one. It moves the pointer to the new
+context into the stack pointer. The new stack has the same form as the old one that swtch just left-the new stack was the old one in a previous call to swtch-
+so swtch can invert the sequence to restore the new context. It pops the values for %edi, %esi, %ebx, and %ebp and then returns. Because swtch has changed the 
+stack pointer, the values restored and the instruction address returned to are the ones from the new context.
+In our example, sched called swtch to switch to cpu->scheduler, the per-CPU scheduler context. That context had been saved by scheduler's call to swtch. When the
+swtch we have been tracing returns, it returns not to shced but to scheduler, and its stack pointers at the current CPU's scheduler stack, not initproc's kernel stack.
+
+Code: Scheduling
+The last section looked at the low-level details of swtch; now let's take swtch as a given and examine the conventions involved in swtching from process to scheduler
+and back to process. A process that wants to give up the CPU must acuire the process table lock ptable.lock, release any other locks it is holding, update its own state
+(proc->state), and then call sched. Yield follows this conventtion, as do sleep and exit, which we will examine later. Sched double-checks those conditions and then an 
+implication of those conditions: since a lock is held, the CPU should be running with interrupts disabled. Finally, sched calls swtch to save the current context in 
+proc->context and switch to the scheduler context in cpu->scheduler. Swtch returns on the scheduler's stack as though scheduler's swtch had returned.
+The scheduler continues the for loop, finds a process to run, switches to it, and the cycle repeats.
+void scheduler(void)
+{
+    struct proc *p;
+    struct cpu *c = mycpu();
+    c->proc = 0;
+
+    for(;;)
+    {
+        // Enable interrupts on this processor.
+        sti();
+
+        // Loop over process table looking for process to run.
+        acquire(&ptable.lock);
+        for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+        {
+            if(p->state != RUNNABLE)
+              continue;
+            
+            c->proc = p;
+            switchuvm(p);
+            p->state = RUNNING;
+
+            swtch(&(c->scheduler), p->context);
+            switchkvm();
+
+            c->proc = 0;
+        }
+        release(&ptable.lock);
+    }
+}
+
+We just saw that xv6 holds ptable.lock across calls to swtch: the caller of swtch must already hold the lock, and control of the lock passes to switched-to
+code. This convention is unusual with locks; usualy the thread that acuqires a lock is also responsible for releasing the lock, which makes it easier to reason
+about correctness. For context switching it is necessary to breal this convention because ptable.lock protects invariants on the process's state and context fields
+that are not true while executing in swtch.
