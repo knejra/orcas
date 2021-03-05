@@ -1,3 +1,5 @@
 # orcas
+一个简单的操作系统，目前支持线程库，文件系统，内存管理和设备驱动。
+当前版本为v0.1。
 A small operating system, supports thread library, file system, memory management and device drivers now.
 Current version is v0.1.
